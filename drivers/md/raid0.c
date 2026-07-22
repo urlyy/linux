@@ -355,6 +355,50 @@ static struct md_rdev *map_sector(struct mddev *mddev, struct strip_zone *zone,
 			     + sector_div(sector, zone->nb_dev)];
 }
 
+static bool raid0_rdev_unavailable(struct md_rdev *rdev)
+{
+	return test_bit(Faulty, &rdev->flags) || is_rdev_broken(rdev);
+}
+
+static bool raid0_is_range_unavailable(struct mddev *mddev, sector_t sector,
+				       sector_t nr_sectors)
+{
+	struct r0conf *conf = mddev->private;
+	sector_t end = sector + nr_sectors;
+
+	while (sector < end) {
+		struct strip_zone *zone;
+		struct md_rdev *rdev;
+		sector_t offset = sector;
+		sector_t zone_sector = sector;
+		sector_t step;
+
+		zone = find_zone(conf, &zone_sector);
+		switch (conf->layout) {
+		case RAID0_ORIG_LAYOUT:
+			rdev = map_sector(mddev, zone, sector, &offset);
+			break;
+		case RAID0_ALT_MULTIZONE_LAYOUT:
+			offset = zone_sector;
+			rdev = map_sector(mddev, zone, zone_sector, &offset);
+			break;
+		default:
+			return true;
+		}
+
+		if (raid0_rdev_unavailable(rdev))
+			return true;
+
+		step = mddev->chunk_sectors -
+		       (sector % mddev->chunk_sectors);
+		step = min(step, zone->zone_end - sector);
+		step = min(step, end - sector);
+		sector += step;
+	}
+
+	return false;
+}
+
 static sector_t raid0_size(struct mddev *mddev, sector_t sectors, int raid_disks)
 {
 	sector_t array_sectors = 0;
@@ -370,6 +414,8 @@ static sector_t raid0_size(struct mddev *mddev, sector_t sectors, int raid_disks
 	return array_sectors;
 }
 
+static const struct attribute_group raid0_attrs_group;
+
 static void raid0_free(struct mddev *mddev, void *priv)
 {
 	struct r0conf *conf = priv;
@@ -377,6 +423,7 @@ static void raid0_free(struct mddev *mddev, void *priv)
 	kvfree(conf->strip_zone);
 	kvfree(conf->devlist);
 	kfree(conf);
+	mddev->to_remove = &raid0_attrs_group;
 }
 
 static int raid0_set_limits(struct mddev *mddev)
@@ -399,6 +446,71 @@ static int raid0_set_limits(struct mddev *mddev)
 		return err;
 	return queue_limits_set(mddev->gendisk->queue, &lim);
 }
+
+static ssize_t raid0_failed_slots_show(struct mddev *mddev, char *page)
+{
+	struct md_rdev *rdev;
+	unsigned long flags;
+	ssize_t len = 0;
+
+	spin_lock_irqsave(&mddev->lock, flags);
+	rdev_for_each(rdev, mddev) {
+		if (!test_bit(Faulty, &rdev->flags))
+			continue;
+		len += scnprintf(page + len, PAGE_SIZE - len, "%s%d",
+				 len ? "," : "",
+				 rdev->raid_disk);
+	}
+	spin_unlock_irqrestore(&mddev->lock, flags);
+
+	if (!len)
+		len = sysfs_emit(page, "none\n");
+	else
+		len += scnprintf(page + len, PAGE_SIZE - len, "\n");
+	return len;
+}
+
+static ssize_t raid0_failed_slots_store(struct mddev *mddev,
+					const char *page, size_t len)
+{
+	struct md_rdev *rdev;
+	int cleared = 0;
+	int err;
+
+	if (!sysfs_streq(page, "clear"))
+		return -EINVAL;
+
+	err = mddev_lock(mddev);
+	if (err)
+		return err;
+	rdev_for_each(rdev, mddev) {
+		if (!test_and_clear_bit(Faulty, &rdev->flags))
+			continue;
+		set_bit(In_sync, &rdev->flags);
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
+		cleared++;
+	}
+	mddev->degraded = 0;
+	mddev_unlock(mddev);
+
+	if (cleared)
+		pr_info("md/raid0:%s: cleared %d failed slot%s\n",
+			mdname(mddev), cleared, str_plural(cleared));
+	return len;
+}
+
+static struct md_sysfs_entry raid0_failed_slots =
+	__ATTR(raid0_failed_slots, S_IRUGO | S_IWUSR,
+	       raid0_failed_slots_show, raid0_failed_slots_store);
+
+static struct attribute *raid0_attrs[] = {
+	&raid0_failed_slots.attr,
+	NULL,
+};
+
+static const struct attribute_group raid0_attrs_group = {
+	.attrs = raid0_attrs,
+};
 
 static int raid0_run(struct mddev *mddev)
 {
@@ -436,7 +548,18 @@ static int raid0_run(struct mddev *mddev)
 
 	dump_zones(mddev);
 
-	return md_integrity_register(mddev);
+	ret = md_integrity_register(mddev);
+	if (ret)
+		return ret;
+
+	if (mddev->to_remove == &raid0_attrs_group)
+		mddev->to_remove = NULL;
+	else if (mddev->kobj.sd &&
+		 sysfs_create_group(&mddev->kobj, &raid0_attrs_group))
+		pr_warn("md/raid0:%s: failed to create sysfs attributes\n",
+			mdname(mddev));
+
+	return 0;
 }
 
 /*
@@ -562,8 +685,6 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 	sector_t bio_sector = bio->bi_iter.bi_sector;
 	sector_t sector = bio_sector;
 
-	md_account_bio(mddev, &bio);
-
 	zone = find_zone(mddev->private, &sector);
 	switch (conf->layout) {
 	case RAID0_ORIG_LAYOUT:
@@ -578,12 +699,14 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 		return;
 	}
 
-	if (unlikely(is_rdev_broken(tmp_dev))) {
+	if (unlikely(raid0_rdev_unavailable(tmp_dev))) {
 		bio_io_error(bio);
-		md_error(mddev, tmp_dev);
+		if (!test_bit(Faulty, &tmp_dev->flags))
+			md_error(mddev, tmp_dev);
 		return;
 	}
 
+	md_account_bio_rdev(mddev, tmp_dev, &bio);
 	bio_set_dev(bio, tmp_dev->bdev);
 	bio->bi_iter.bi_sector = sector + zone->dev_start +
 		tmp_dev->data_offset;
@@ -628,18 +751,44 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 
 static void raid0_status(struct seq_file *seq, struct mddev *mddev)
 {
-	seq_printf(seq, " %dk chunks", mddev->chunk_sectors / 2);
-	return;
+	struct md_rdev *rdev;
+	int slot;
+
+	seq_printf(seq, " %dk chunks [%d/%d] [", mddev->chunk_sectors / 2,
+		   mddev->raid_disks, mddev->raid_disks - mddev->degraded);
+	for (slot = 0; slot < mddev->raid_disks; slot++) {
+		bool online = false;
+
+		rdev_for_each(rdev, mddev) {
+			if (rdev->raid_disk == slot &&
+			    !test_bit(Faulty, &rdev->flags)) {
+				online = true;
+				break;
+			}
+		}
+		seq_putc(seq, online ? 'U' : '_');
+	}
+	seq_putc(seq, ']');
 }
 
 static void raid0_error(struct mddev *mddev, struct md_rdev *rdev)
 {
-	if (!test_and_set_bit(MD_BROKEN, &mddev->flags)) {
-		char *md_name = mdname(mddev);
+	unsigned long flags;
+	bool newly_failed = false;
 
-		pr_crit("md/raid0%s: Disk failure on %pg detected, failing array.\n",
-			md_name, rdev->bdev);
+	spin_lock_irqsave(&mddev->lock, flags);
+	if (!test_and_set_bit(Faulty, &rdev->flags)) {
+		if (test_and_clear_bit(In_sync, &rdev->flags))
+			mddev->degraded++;
+		newly_failed = true;
 	}
+	spin_unlock_irqrestore(&mddev->lock, flags);
+
+	if (!newly_failed)
+		return;
+	sysfs_notify_dirent_safe(rdev->sysfs_state);
+	pr_crit("md/raid0:%s: Disk failure on %pg detected; continuing only on healthy mappings.\n",
+		mdname(mddev), rdev->bdev);
 }
 
 static void *raid0_takeover_raid45(struct mddev *mddev)
@@ -815,6 +964,7 @@ static struct md_personality raid0_personality=
 	},
 
 	.make_request	= raid0_make_request,
+	.is_range_unavailable = raid0_is_range_unavailable,
 	.run		= raid0_run,
 	.free		= raid0_free,
 	.status		= raid0_status,

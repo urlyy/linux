@@ -17,6 +17,7 @@
 #include <linux/nospec.h>
 #include <linux/backing-dev.h>
 #include <linux/freezer.h>
+#include <linux/md.h>
 #include <trace/events/ext4.h>
 #include <kunit/static_stub.h>
 
@@ -2231,6 +2232,31 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	return ret;
 }
 
+static ext4_grpblk_t
+ext4_mb_usable_prefix(struct super_block *sb, struct ext4_free_extent *ex)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	ext4_fsblk_t first = ext4_grp_offs_to_block(sb, ex);
+	sector_t cluster_sectors;
+	ext4_grpblk_t i;
+
+	if (!md_bdev_is_degraded(sb->s_bdev))
+		return ex->fe_len;
+
+	cluster_sectors = (sector_t)(sb->s_blocksize >> SECTOR_SHIFT) <<
+			  sbi->s_cluster_bits;
+	for (i = 0; i < ex->fe_len; i++) {
+		ext4_fsblk_t block = first + EXT4_C2B(sbi, i);
+		sector_t sector = block <<
+				  (sb->s_blocksize_bits - SECTOR_SHIFT);
+
+		if (md_bdev_range_is_unavailable(sb->s_bdev, sector,
+						 cluster_sectors))
+			break;
+	}
+	return i;
+}
+
 /*
  * Must be called under group lock!
  */
@@ -2238,12 +2264,28 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 					struct ext4_buddy *e4b)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+	ext4_grpblk_t usable;
 	int ret;
 
 	BUG_ON(ac->ac_b_ex.fe_group != e4b->bd_group);
 	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
 
 	ac->ac_b_ex.fe_len = min(ac->ac_b_ex.fe_len, ac->ac_g_ex.fe_len);
+	usable = ext4_mb_usable_prefix(ac->ac_sb, &ac->ac_b_ex);
+	if (!usable) {
+		struct ext4_free_extent unavailable = ac->ac_b_ex;
+
+		/*
+		 * Keep a failed RAID0 cluster reserved in the in-core buddy.
+		 * The on-disk bitmap is deliberately left unchanged so the
+		 * reservation disappears after the failed member is restored.
+		 */
+		unavailable.fe_len = 1;
+		mb_mark_used(e4b, &unavailable);
+		ac->ac_b_ex.fe_len = 0;
+		return;
+	}
+	ac->ac_b_ex.fe_len = usable;
 	ac->ac_b_ex.fe_logical = ac->ac_g_ex.fe_logical;
 	ret = mb_mark_used(e4b, &ac->ac_b_ex);
 
@@ -4886,6 +4928,8 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	/* only data can be preallocated */
 	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
 		return false;
+	if (md_bdev_is_degraded(ac->ac_sb->s_bdev))
+		return false;
 
 	/*
 	 * first, try per-file preallocation by searching the inode pa rbtree.
@@ -5917,6 +5961,8 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 	ac->ac_g_ex = ac->ac_o_ex;
 	ac->ac_orig_goal_len = ac->ac_g_ex.fe_len;
 	ac->ac_flags = ar->flags;
+	if (md_bdev_is_degraded(sb->s_bdev))
+		ac->ac_flags |= EXT4_MB_HINT_NOPREALLOC;
 
 	/* we have to define context: we'll work with a file or
 	 * locality group. this is a policy, actually */

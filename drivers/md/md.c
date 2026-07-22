@@ -64,6 +64,7 @@
 #include <linux/slab.h>
 #include <linux/percpu-refcount.h>
 #include <linux/part_stat.h>
+#include <linux/md.h>
 
 #include "md.h"
 #include "md-bitmap.h"
@@ -8639,6 +8640,36 @@ const struct block_device_operations md_fops =
 	.free_disk	= md_free_disk,
 };
 
+bool md_bdev_is_degraded(struct block_device *bdev)
+{
+	struct mddev *mddev;
+
+	if (bdev->bd_disk->fops != &md_fops)
+		return false;
+	mddev = bdev->bd_disk->private_data;
+	return READ_ONCE(mddev->degraded) > 0 ||
+	       test_bit(MD_BROKEN, &mddev->flags);
+}
+EXPORT_SYMBOL_GPL(md_bdev_is_degraded);
+
+bool md_bdev_range_is_unavailable(struct block_device *bdev,
+				  sector_t sector, sector_t nr_sectors)
+{
+	struct mddev *mddev;
+	struct md_personality *pers;
+
+	if (!nr_sectors || bdev->bd_disk->fops != &md_fops)
+		return false;
+	mddev = bdev->bd_disk->private_data;
+	pers = READ_ONCE(mddev->pers);
+	if (!pers || !pers->is_range_unavailable)
+		return false;
+	return pers->is_range_unavailable(mddev,
+					  bdev->bd_start_sect + sector,
+					  nr_sectors);
+}
+EXPORT_SYMBOL_GPL(md_bdev_range_is_unavailable);
+
 static int md_thread(void *arg)
 {
 	struct md_thread *thread = arg;
@@ -9394,6 +9425,8 @@ static void md_end_clone_io(struct bio *bio)
 
 	if (bio_data_dir(orig_bio) == WRITE && md_bitmap_enabled(mddev, false))
 		md_bitmap_end(mddev, md_io_clone);
+	if (unlikely(bio->bi_status) && md_io_clone->rdev)
+		md_error(mddev, md_io_clone->rdev);
 
 	if (bio->bi_status && !orig_bio->bi_status)
 		orig_bio->bi_status = bio->bi_status;
@@ -9419,6 +9452,7 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
 	md_io_clone = container_of(clone, struct md_io_clone, bio_clone);
 	md_io_clone->orig_bio = *bio;
 	md_io_clone->mddev = mddev;
+	md_io_clone->rdev = NULL;
 	if (blk_queue_io_stat(bdev->bd_disk->queue))
 		md_io_clone->start_time = bio_start_io_acct(*bio);
 
@@ -9440,6 +9474,17 @@ void md_account_bio(struct mddev *mddev, struct bio **bio)
 	md_clone_bio(mddev, bio);
 }
 EXPORT_SYMBOL_GPL(md_account_bio);
+
+void md_account_bio_rdev(struct mddev *mddev, struct md_rdev *rdev,
+			 struct bio **bio)
+{
+	struct md_io_clone *md_io_clone;
+
+	md_account_bio(mddev, bio);
+	md_io_clone = container_of(*bio, struct md_io_clone, bio_clone);
+	md_io_clone->rdev = rdev;
+}
+EXPORT_SYMBOL_GPL(md_account_bio_rdev);
 
 /* md_allow_write(mddev)
  * Calling this ensures that the array is marked 'active' so that writes
