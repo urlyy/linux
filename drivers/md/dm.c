@@ -32,6 +32,7 @@
 #include <linux/part_stat.h>
 #include <linux/blk-crypto.h>
 #include <linux/blk-crypto-profile.h>
+#include <linux/overflow.h>
 
 #define DM_MSG_PREFIX "core"
 
@@ -694,6 +695,76 @@ void dm_put_live_table(struct mapped_device *md,
 {
 	srcu_read_unlock(&md->io_barrier, srcu_idx);
 }
+
+bool dm_bdev_is_degraded(struct block_device *bdev)
+{
+	struct mapped_device *md;
+	struct dm_table *map;
+	struct dm_target *ti;
+	sector_t sector = bdev->bd_start_sect;
+	sector_t end = sector + bdev_nr_sectors(bdev);
+	int srcu_idx;
+	bool degraded = false;
+
+	md = dm_get_md(bdev->bd_dev);
+	if (!md)
+		return false;
+	map = dm_get_live_table(md, &srcu_idx);
+	while (map && sector < end) {
+		ti = dm_table_find_target(map, sector);
+		if (!ti || sector < ti->begin || sector >= ti->begin + ti->len)
+			break;
+		if (ti->type->is_degraded && ti->type->is_degraded(ti)) {
+			degraded = true;
+			break;
+		}
+		sector = min(end, ti->begin + ti->len);
+	}
+	dm_put_live_table(md, srcu_idx);
+	dm_put(md);
+	return degraded;
+}
+EXPORT_SYMBOL_GPL(dm_bdev_is_degraded);
+
+bool dm_bdev_range_is_unavailable(struct block_device *bdev,
+				  sector_t sector, sector_t nr_sectors)
+{
+	struct mapped_device *md;
+	struct dm_table *map;
+	struct dm_target *ti;
+	sector_t end;
+	sector_t step;
+	int srcu_idx;
+	bool unavailable = false;
+
+	if (!nr_sectors ||
+	    check_add_overflow(sector, nr_sectors, &end) ||
+	    check_add_overflow(sector, bdev->bd_start_sect, &sector) ||
+	    check_add_overflow(end, bdev->bd_start_sect, &end))
+		return false;
+	md = dm_get_md(bdev->bd_dev);
+	if (!md)
+		return false;
+	map = dm_get_live_table(md, &srcu_idx);
+	while (map && sector < end) {
+		ti = dm_table_find_target(map, sector);
+		if (!ti || sector < ti->begin || sector >= ti->begin + ti->len) {
+			unavailable = true;
+			break;
+		}
+		step = min(end, ti->begin + ti->len) - sector;
+		if (ti->type->is_range_unavailable &&
+		    ti->type->is_range_unavailable(ti, sector, step)) {
+			unavailable = true;
+			break;
+		}
+		sector += step;
+	}
+	dm_put_live_table(md, srcu_idx);
+	dm_put(md);
+	return unavailable;
+}
+EXPORT_SYMBOL_GPL(dm_bdev_range_is_unavailable);
 
 void dm_sync_table(struct mapped_device *md)
 {

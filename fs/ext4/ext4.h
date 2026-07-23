@@ -1593,6 +1593,7 @@ struct ext4_sb_info {
 	unsigned long s_gdb_count;	/* Number of group descriptor blocks */
 	unsigned long s_desc_per_block;	/* Number of group descriptors per block */
 	ext4_group_t s_groups_count;	/* Number of groups in the fs */
+	ext4_group_t s_reliable_groups; /* Groups mapped to reliable metadata */
 	ext4_group_t s_blockfile_groups;/* Groups acceptable for non-extent files */
 	unsigned long s_overhead;  /* # of fs overhead clusters */
 	unsigned int s_cluster_ratio;	/* Number of blocks per cluster */

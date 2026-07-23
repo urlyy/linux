@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/nospec.h>
 #include <linux/backing-dev.h>
+#include <linux/device-mapper.h>
 #include <linux/freezer.h>
 #include <linux/md.h>
 #include <trace/events/ext4.h>
@@ -2232,6 +2233,60 @@ static int mb_mark_used(struct ext4_buddy *e4b, struct ext4_free_extent *ex)
 	return ret;
 }
 
+static bool ext4_bdev_is_degraded(struct block_device *bdev)
+{
+	if (md_bdev_is_degraded(bdev))
+		return true;
+#if IS_BUILTIN(CONFIG_BLK_DEV_DM)
+	return dm_bdev_is_degraded(bdev);
+#else
+	return false;
+#endif
+}
+
+static bool ext4_bdev_range_is_unavailable(struct block_device *bdev,
+					   sector_t sector,
+					   sector_t nr_sectors)
+{
+	if (md_bdev_range_is_unavailable(bdev, sector, nr_sectors))
+		return true;
+#if IS_BUILTIN(CONFIG_BLK_DEV_DM)
+	return dm_bdev_range_is_unavailable(bdev, sector, nr_sectors);
+#else
+	return false;
+#endif
+}
+
+/*
+ * reliable_groups splits one ext4 address space into a reliable metadata
+ * prefix and a striped regular-file-data suffix.  The setup tool maps the
+ * prefix to RAID1 and the suffix to RAID0.  Directory and symlink contents,
+ * extent tree blocks, xattrs, quota data, and all other metadata stay in the
+ * reliable prefix; only regular file contents use the striped suffix.
+ */
+static bool ext4_mb_reliable_allocation(struct ext4_allocation_context *ac)
+{
+	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
+		return true;
+	if (!S_ISREG(ac->ac_inode->i_mode))
+		return true;
+	if (ext4_is_quota_file(ac->ac_inode))
+		return true;
+	return ext4_test_inode_flag(ac->ac_inode, EXT4_INODE_EA_INODE);
+}
+
+static bool ext4_mb_group_allowed(struct ext4_allocation_context *ac,
+				  ext4_group_t group)
+{
+	ext4_group_t reliable = EXT4_SB(ac->ac_sb)->s_reliable_groups;
+
+	if (!reliable)
+		return true;
+	if (ext4_mb_reliable_allocation(ac))
+		return group < reliable;
+	return group >= reliable;
+}
+
 static ext4_grpblk_t
 ext4_mb_usable_prefix(struct super_block *sb, struct ext4_free_extent *ex)
 {
@@ -2240,7 +2295,7 @@ ext4_mb_usable_prefix(struct super_block *sb, struct ext4_free_extent *ex)
 	sector_t cluster_sectors;
 	ext4_grpblk_t i;
 
-	if (!md_bdev_is_degraded(sb->s_bdev))
+	if (!ext4_bdev_is_degraded(sb->s_bdev))
 		return ex->fe_len;
 
 	cluster_sectors = (sector_t)(sb->s_blocksize >> SECTOR_SHIFT) <<
@@ -2250,8 +2305,8 @@ ext4_mb_usable_prefix(struct super_block *sb, struct ext4_free_extent *ex)
 		sector_t sector = block <<
 				  (sb->s_blocksize_bits - SECTOR_SHIFT);
 
-		if (md_bdev_range_is_unavailable(sb->s_bdev, sector,
-						 cluster_sectors))
+		if (ext4_bdev_range_is_unavailable(sb->s_bdev, sector,
+						   cluster_sectors))
 			break;
 	}
 	return i;
@@ -2756,6 +2811,9 @@ static bool ext4_mb_good_group(struct ext4_allocation_context *ac,
 
 	BUG_ON(cr < CR_POWER2_ALIGNED || cr >= EXT4_MB_NUM_CRS);
 
+	if (!ext4_mb_group_allowed(ac, group))
+		return false;
+
 	if (unlikely(!grp || EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
 		return false;
 
@@ -2825,6 +2883,9 @@ static int ext4_mb_good_group_nolock(struct ext4_allocation_context *ac,
 	bool should_lock = ac->ac_flags & EXT4_MB_STRICT_CHECK;
 	ext4_grpblk_t free;
 	int ret = 0;
+
+	if (!ext4_mb_group_allowed(ac, group))
+		return 0;
 
 	if (!grp)
 		return -EFSCORRUPTED;
@@ -4928,7 +4989,7 @@ ext4_mb_use_preallocated(struct ext4_allocation_context *ac)
 	/* only data can be preallocated */
 	if (!(ac->ac_flags & EXT4_MB_HINT_DATA))
 		return false;
-	if (md_bdev_is_degraded(ac->ac_sb->s_bdev))
+	if (ext4_bdev_is_degraded(ac->ac_sb->s_bdev))
 		return false;
 
 	/*
@@ -5948,20 +6009,31 @@ ext4_mb_initialize_context(struct ext4_allocation_context *ac,
 			goal >= ext4_blocks_count(es))
 		goal = le32_to_cpu(es->s_first_data_block);
 	ext4_get_group_no_and_offset(sb, goal, &group, &block);
+	ac->ac_sb = sb;
+	ac->ac_inode = ar->inode;
+	ac->ac_flags = ar->flags;
+	if (sbi->s_reliable_groups) {
+		bool reliable = ext4_mb_reliable_allocation(ac);
+
+		if (reliable && group >= sbi->s_reliable_groups) {
+			group = 0;
+			block = 0;
+		} else if (!reliable && group < sbi->s_reliable_groups) {
+			group = sbi->s_reliable_groups;
+			block = 0;
+		}
+	}
 
 	/* set up allocation goals */
 	ac->ac_b_ex.fe_logical = EXT4_LBLK_CMASK(sbi, ar->logical);
 	ac->ac_status = AC_STATUS_CONTINUE;
-	ac->ac_sb = sb;
-	ac->ac_inode = ar->inode;
 	ac->ac_o_ex.fe_logical = ac->ac_b_ex.fe_logical;
 	ac->ac_o_ex.fe_group = group;
 	ac->ac_o_ex.fe_start = block;
 	ac->ac_o_ex.fe_len = len;
 	ac->ac_g_ex = ac->ac_o_ex;
 	ac->ac_orig_goal_len = ac->ac_g_ex.fe_len;
-	ac->ac_flags = ar->flags;
-	if (md_bdev_is_degraded(sb->s_bdev))
+	if (ext4_bdev_is_degraded(sb->s_bdev))
 		ac->ac_flags |= EXT4_MB_HINT_NOPREALLOC;
 
 	/* we have to define context: we'll work with a file or
@@ -6289,6 +6361,25 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	sbi = EXT4_SB(sb);
 
 	trace_ext4_request_blocks(ar);
+	/*
+	 * The reliable_groups layout puts regular-file contents on RAID0 and
+	 * filesystem metadata in the mirrored prefix.  Once any lower member is
+	 * unavailable, allocating new regular-file data cannot be made reliable:
+	 * scanning around failed RAID0 ranges also violates mballoc's assumption
+	 * that a selected power-of-two extent is consumed in full.  Fail the data
+	 * allocation before entering the buddy allocator.  Metadata allocations
+	 * are still allowed and therefore directory operations remain available.
+	 */
+	if (sbi->s_reliable_groups &&
+	    (ar->flags & EXT4_MB_HINT_DATA) &&
+	    S_ISREG(ar->inode->i_mode) &&
+	    !ext4_is_quota_file(ar->inode) &&
+	    !ext4_test_inode_flag(ar->inode, EXT4_INODE_EA_INODE) &&
+	    ext4_bdev_is_degraded(sb->s_bdev)) {
+		ar->len = 0;
+		*errp = -EIO;
+		return 0;
+	}
 	if (sbi->s_mount_state & EXT4_FC_REPLAY)
 		return ext4_mb_new_blocks_simple(ar, errp);
 

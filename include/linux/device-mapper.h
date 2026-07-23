@@ -139,6 +139,11 @@ typedef int (*dm_iterate_devices_fn) (struct dm_target *ti,
 				      iterate_devices_callout_fn fn,
 				      void *data);
 
+typedef bool (*dm_is_degraded_fn) (struct dm_target *ti);
+typedef bool (*dm_is_range_unavailable_fn) (struct dm_target *ti,
+					     sector_t sector,
+					     sector_t nr_sectors);
+
 typedef void (*dm_io_hints_fn) (struct dm_target *ti,
 				struct queue_limits *limits);
 
@@ -218,6 +223,8 @@ struct target_type {
 	dm_report_zones_fn report_zones;
 	dm_busy_fn busy;
 	dm_iterate_devices_fn iterate_devices;
+	dm_is_degraded_fn is_degraded;
+	dm_is_range_unavailable_fn is_range_unavailable;
 	dm_io_hints_fn io_hints;
 	dm_dax_direct_access_fn direct_access;
 	dm_dax_zero_page_range_fn dax_zero_page_range;
@@ -617,6 +624,10 @@ int __must_check dm_set_target_max_io_len(struct dm_target *ti, sector_t len);
  */
 struct dm_table *dm_get_live_table(struct mapped_device *md, int *srcu_idx);
 void dm_put_live_table(struct mapped_device *md, int srcu_idx);
+
+bool dm_bdev_is_degraded(struct block_device *bdev);
+bool dm_bdev_range_is_unavailable(struct block_device *bdev,
+				  sector_t sector, sector_t nr_sectors);
 void dm_sync_table(struct mapped_device *md);
 
 /*

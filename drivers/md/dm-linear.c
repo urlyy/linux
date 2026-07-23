@@ -13,6 +13,7 @@
 #include <linux/dax.h>
 #include <linux/slab.h>
 #include <linux/device-mapper.h>
+#include <linux/md.h>
 
 #define DM_MSG_PREFIX "linear"
 
@@ -158,6 +159,24 @@ static int linear_iterate_devices(struct dm_target *ti,
 	return fn(ti, lc->dev, lc->start, ti->len, data);
 }
 
+static bool linear_is_degraded(struct dm_target *ti)
+{
+	struct linear_c *lc = ti->private;
+
+	return md_bdev_is_degraded(lc->dev->bdev);
+}
+
+static bool linear_is_range_unavailable(struct dm_target *ti,
+					sector_t sector,
+					sector_t nr_sectors)
+{
+	struct linear_c *lc = ti->private;
+
+	return md_bdev_range_is_unavailable(lc->dev->bdev,
+					    linear_map_sector(ti, sector),
+					    nr_sectors);
+}
+
 #if IS_ENABLED(CONFIG_FS_DAX)
 static struct dax_device *linear_dax_pgoff(struct dm_target *ti, pgoff_t *pgoff)
 {
@@ -213,6 +232,8 @@ static struct target_type linear_target = {
 	.status = linear_status,
 	.prepare_ioctl = linear_prepare_ioctl,
 	.iterate_devices = linear_iterate_devices,
+	.is_degraded = linear_is_degraded,
+	.is_range_unavailable = linear_is_range_unavailable,
 	.direct_access = linear_dax_direct_access,
 	.dax_zero_page_range = linear_dax_zero_page_range,
 	.dax_recovery_write = linear_dax_recovery_write,

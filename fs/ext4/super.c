@@ -1713,6 +1713,7 @@ enum {
 	Opt_max_dir_size_kb, Opt_nojournal_checksum, Opt_nombcache,
 	Opt_no_prefetch_block_bitmaps, Opt_mb_optimize_scan,
 	Opt_errors, Opt_data, Opt_data_err, Opt_jqfmt, Opt_dax_type,
+	Opt_reliable_groups,
 #ifdef CONFIG_EXT4_DEBUG
 	Opt_fc_debug_max_replay, Opt_fc_debug_force
 #endif
@@ -1850,6 +1851,7 @@ static const struct fs_parameter_spec ext4_param_specs[] = {
 	fsparam_flag	("no_prefetch_block_bitmaps",
 						Opt_no_prefetch_block_bitmaps),
 	fsparam_s32	("mb_optimize_scan",	Opt_mb_optimize_scan),
+	fsparam_u32	("reliable_groups",	Opt_reliable_groups),
 	fsparam_string	("check",		Opt_removed),	/* mount option from ext2/3 */
 	fsparam_flag	("nocheck",		Opt_removed),	/* mount option from ext2/3 */
 	fsparam_flag	("reservation",		Opt_removed),	/* mount option from ext2/3 */
@@ -1943,6 +1945,7 @@ static const struct mount_opts {
 	{Opt_nombcache, EXT4_MOUNT_NO_MBCACHE, MOPT_SET},
 	{Opt_no_prefetch_block_bitmaps, EXT4_MOUNT_NO_PREFETCH_BLOCK_BITMAPS,
 	 MOPT_SET},
+	{Opt_reliable_groups, 0, MOPT_EXT4_ONLY},
 #ifdef CONFIG_EXT4_DEBUG
 	{Opt_fc_debug_force, EXT4_MOUNT2_JOURNAL_FAST_COMMIT,
 	 MOPT_SET | MOPT_2 | MOPT_EXT4_ONLY},
@@ -1993,6 +1996,7 @@ ext4_sb_read_encoding(const struct ext4_super_block *es)
 #define EXT4_SPEC_s_fc_debug_max_replay		(1 << 17)
 #define EXT4_SPEC_s_sb_block			(1 << 18)
 #define EXT4_SPEC_mb_optimize_scan		(1 << 19)
+#define EXT4_SPEC_s_reliable_groups		(1 << 20)
 
 struct ext4_fs_context {
 	char		*s_qf_names[EXT4_MAXQUOTAS];
@@ -2011,6 +2015,7 @@ struct ext4_fs_context {
 	unsigned int	s_want_extra_isize;
 	unsigned int	s_li_wait_mult;
 	unsigned int	s_max_dir_size_kb;
+	ext4_group_t	s_reliable_groups;
 	unsigned int	journal_ioprio;
 	unsigned int	vals_s_mount_opt;
 	unsigned int	mask_s_mount_opt;
@@ -2303,6 +2308,10 @@ static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_max_dir_size_kb:
 		ctx->s_max_dir_size_kb = result.uint_32;
 		ctx->spec |= EXT4_SPEC_s_max_dir_size_kb;
+		return 0;
+	case Opt_reliable_groups:
+		ctx->s_reliable_groups = result.uint_32;
+		ctx->spec |= EXT4_SPEC_s_reliable_groups;
 		return 0;
 #ifdef CONFIG_EXT4_DEBUG
 	case Opt_fc_debug_max_replay:
@@ -2796,6 +2805,32 @@ static int ext4_check_opt_consistency(struct fs_context *fc,
 			 ctx->s_want_extra_isize);
 		return -EINVAL;
 	}
+	if (ctx->spec & EXT4_SPEC_s_reliable_groups) {
+		if (!ctx->s_reliable_groups) {
+			ext4_msg(NULL, KERN_ERR,
+				 "reliable_groups must be at least 1");
+			return -EINVAL;
+		}
+		/* s_groups_count is initialized later during the first mount. */
+		if (sbi->s_groups_count &&
+		    ctx->s_reliable_groups >= sbi->s_groups_count) {
+			ext4_msg(NULL, KERN_ERR,
+				 "reliable_groups must be between 1 and %u",
+				 sbi->s_groups_count - 1);
+			return -EINVAL;
+		}
+		if (!ext4_has_feature_flex_bg(sb)) {
+			ext4_msg(NULL, KERN_ERR,
+				 "reliable_groups requires flex_bg");
+			return -EINVAL;
+		}
+		if (is_remount &&
+		    ctx->s_reliable_groups != sbi->s_reliable_groups) {
+			ext4_msg(NULL, KERN_ERR,
+				 "cannot change reliable_groups on remount");
+			return -EINVAL;
+		}
+	}
 
 	err = ext4_check_test_dummy_encryption(fc, sb);
 	if (err)
@@ -2872,6 +2907,7 @@ static void ext4_apply_options(struct fs_context *fc, struct super_block *sb)
 	APPLY(s_want_extra_isize);
 	APPLY(s_inode_readahead_blks);
 	APPLY(s_max_dir_size_kb);
+	APPLY(s_reliable_groups);
 	APPLY(s_li_wait_mult);
 	APPLY(s_resgid);
 	APPLY(s_resuid);
@@ -3048,6 +3084,8 @@ static int _ext4_show_options(struct seq_file *seq, struct super_block *sb,
 		SEQ_OPTS_PRINT("init_itable=%u", sbi->s_li_wait_mult);
 	if (nodefs || sbi->s_max_dir_size_kb)
 		SEQ_OPTS_PRINT("max_dir_size_kb=%u", sbi->s_max_dir_size_kb);
+	if (nodefs || sbi->s_reliable_groups)
+		SEQ_OPTS_PRINT("reliable_groups=%u", sbi->s_reliable_groups);
 	if (test_opt(sb, DATA_ERR_ABORT))
 		SEQ_OPTS_PUTS("data_err=abort");
 
@@ -5436,6 +5474,13 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	err = ext4_check_geometry(sb, es);
 	if (err)
 		goto failed_mount;
+	if (sbi->s_reliable_groups >= sbi->s_groups_count) {
+		ext4_msg(sb, KERN_ERR,
+			 "reliable_groups must be smaller than groups count %u",
+			 sbi->s_groups_count);
+		err = -EINVAL;
+		goto failed_mount;
+	}
 
 	timer_setup(&sbi->s_err_report, print_daily_error_info, 0);
 	spin_lock_init(&sbi->s_error_lock);
