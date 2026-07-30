@@ -5054,6 +5054,18 @@ static int ext4_load_and_init_journal(struct super_block *sb,
 		break;
 	}
 
+	if (sbi->s_reliable_groups &&
+	    test_opt(sb, DATA_FLAGS) != EXT4_MOUNT_ORDERED_DATA) {
+		ext4_msg(sb, KERN_ERR,
+			 "reliable_groups requires data=ordered");
+		goto out;
+	}
+	if (sbi->s_reliable_groups && test_opt(sb, DATA_ERR_ABORT)) {
+		ext4_msg(sb, KERN_ERR,
+			 "reliable_groups is incompatible with data_err=abort");
+		goto out;
+	}
+
 	if (test_opt(sb, DATA_FLAGS) == EXT4_MOUNT_ORDERED_DATA &&
 	    test_opt(sb, JOURNAL_ASYNC_COMMIT)) {
 		ext4_msg(sb, KERN_ERR, "can't mount with "
@@ -5566,6 +5578,12 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 		goto failed_mount3a;
 	} else {
 		const char *journal_option;
+
+		if (sbi->s_reliable_groups) {
+			ext4_msg(sb, KERN_ERR,
+				 "reliable_groups requires an active journal");
+			goto failed_mount3a;
+		}
 
 		/* Nojournal mode, all journal mount options are illegal */
 		journal_option = ext4_has_journal_option(sb);

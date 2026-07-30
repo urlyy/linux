@@ -495,6 +495,12 @@ struct mddev {
 	atomic64_t			resync_mismatches; /* count of sectors where
 							    * parity/replica mismatch found
 							    */
+	/*
+	 * Changes whenever a member becomes unavailable or its bad-block
+	 * map changes.  Filesystems use this as a lockless allocation
+	 * snapshot; zero is never published by an initialized mddev.
+	 */
+	atomic64_t			availability_generation;
 
 	/* allow user-space to request suspension of IO to regions of the array */
 	sector_t			suspend_lo;
@@ -755,6 +761,10 @@ struct md_personality
 	bool __must_check (*make_request)(struct mddev *mddev, struct bio *bio);
 	bool (*is_range_unavailable)(struct mddev *mddev, sector_t sector,
 				     sector_t nr_sectors);
+	bool (*has_unavailable)(struct mddev *mddev);
+	bool (*record_io_error)(struct mddev *mddev, struct md_rdev *rdev,
+				sector_t sector, sector_t nr_sectors,
+				blk_status_t status, enum req_op op);
 	/*
 	 * start up works that do NOT require md_thread. tasks that
 	 * requires md_thread should go into start()
@@ -881,6 +891,9 @@ struct md_io_clone {
 	struct mddev	*mddev;
 	struct md_rdev	*rdev;
 	struct bio	*orig_bio;
+	sector_t	rdev_sector;
+	sector_t	nr_sectors;
+	enum req_op	op;
 	unsigned long	start_time;
 	sector_t	offset;
 	unsigned long	sectors;
@@ -926,7 +939,8 @@ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
 			struct bio *bio, sector_t start, sector_t size);
 void md_account_bio(struct mddev *mddev, struct bio **bio);
 void md_account_bio_rdev(struct mddev *mddev, struct md_rdev *rdev,
-			 struct bio **bio);
+			 sector_t rdev_sector, struct bio **bio);
+void md_availability_changed(struct mddev *mddev);
 
 extern bool __must_check md_flush_request(struct mddev *mddev, struct bio *bio);
 void md_write_metadata(struct mddev *mddev, struct md_rdev *rdev,

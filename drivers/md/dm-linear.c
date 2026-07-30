@@ -177,6 +177,13 @@ static bool linear_is_range_unavailable(struct dm_target *ti,
 					    nr_sectors);
 }
 
+static u64 linear_availability_generation(struct dm_target *ti)
+{
+	struct linear_c *lc = ti->private;
+
+	return md_bdev_availability_generation(lc->dev->bdev);
+}
+
 #if IS_ENABLED(CONFIG_FS_DAX)
 static struct dax_device *linear_dax_pgoff(struct dm_target *ti, pgoff_t *pgoff)
 {
@@ -234,6 +241,7 @@ static struct target_type linear_target = {
 	.iterate_devices = linear_iterate_devices,
 	.is_degraded = linear_is_degraded,
 	.is_range_unavailable = linear_is_range_unavailable,
+	.availability_generation = linear_availability_generation,
 	.direct_access = linear_dax_direct_access,
 	.dax_zero_page_range = linear_dax_zero_page_range,
 	.dax_recovery_write = linear_dax_recovery_write,

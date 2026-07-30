@@ -2257,6 +2257,20 @@ static bool ext4_bdev_range_is_unavailable(struct block_device *bdev,
 #endif
 }
 
+static u64 ext4_bdev_availability_generation(struct block_device *bdev)
+{
+	u64 generation;
+
+	generation = md_bdev_availability_generation(bdev);
+	if (generation)
+		return generation;
+#if IS_BUILTIN(CONFIG_BLK_DEV_DM)
+	return dm_bdev_availability_generation(bdev);
+#else
+	return 0;
+#endif
+}
+
 /*
  * reliable_groups splits one ext4 address space into a reliable metadata
  * prefix and a striped regular-file-data suffix.  The setup tool maps the
@@ -2287,29 +2301,78 @@ static bool ext4_mb_group_allowed(struct ext4_allocation_context *ac,
 	return group >= reliable;
 }
 
+#define EXT4_MB_HEALTH_SCAN_RETRIES 4
+
 static ext4_grpblk_t
-ext4_mb_usable_prefix(struct super_block *sb, struct ext4_free_extent *ex)
+ext4_mb_find_usable_extent(struct super_block *sb,
+			    struct ext4_free_extent *ex,
+			    ext4_grpblk_t *unavailable)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	ext4_fsblk_t first = ext4_grp_offs_to_block(sb, ex);
 	sector_t cluster_sectors;
-	ext4_grpblk_t i;
-
-	if (!ext4_bdev_is_degraded(sb->s_bdev))
-		return ex->fe_len;
+	sector_t first_sector;
+	ext4_grpblk_t i, usable;
+	u64 before, after;
+	int attempt;
 
 	cluster_sectors = (sector_t)(sb->s_blocksize >> SECTOR_SHIFT) <<
 			  sbi->s_cluster_bits;
-	for (i = 0; i < ex->fe_len; i++) {
-		ext4_fsblk_t block = first + EXT4_C2B(sbi, i);
-		sector_t sector = block <<
-				  (sb->s_blocksize_bits - SECTOR_SHIFT);
+	first_sector = first << (sb->s_blocksize_bits - SECTOR_SHIFT);
 
-		if (ext4_bdev_range_is_unavailable(sb->s_bdev, sector,
-						   cluster_sectors))
-			break;
+	/*
+	 * A fault can be reported while mballoc is examining a free extent.
+	 * Retry a bounded number of times until the lower-device generation
+	 * is stable around the complete scan.  Continuous fault churn makes
+	 * this candidate unusable for now instead of risking a stale choice.
+	 */
+	for (attempt = 0; attempt < EXT4_MB_HEALTH_SCAN_RETRIES; attempt++) {
+		before = ext4_bdev_availability_generation(sb->s_bdev);
+		*unavailable = 0;
+
+		if (!ext4_bdev_is_degraded(sb->s_bdev)) {
+			usable = ex->fe_len;
+			goto verify;
+		}
+
+		/* Most candidates do not intersect a failed stripe or range. */
+		if (!ext4_bdev_range_is_unavailable(sb->s_bdev, first_sector,
+				(sector_t)ex->fe_len * cluster_sectors)) {
+			usable = ex->fe_len;
+			goto verify;
+		}
+
+		for (i = 0; i < ex->fe_len; i++) {
+			ext4_fsblk_t block = first + EXT4_C2B(sbi, i);
+			sector_t sector = block <<
+				(sb->s_blocksize_bits - SECTOR_SHIFT);
+
+			if (!ext4_bdev_range_is_unavailable(sb->s_bdev,
+							    sector,
+							    cluster_sectors))
+				break;
+		}
+		*unavailable = i;
+
+		for (usable = 0; i + usable < ex->fe_len; usable++) {
+			ext4_fsblk_t block =
+				first + EXT4_C2B(sbi, i + usable);
+			sector_t sector = block <<
+				(sb->s_blocksize_bits - SECTOR_SHIFT);
+
+			if (ext4_bdev_range_is_unavailable(sb->s_bdev,
+							   sector,
+							   cluster_sectors))
+				break;
+		}
+verify:
+		after = ext4_bdev_availability_generation(sb->s_bdev);
+		if (before == after)
+			return usable;
 	}
-	return i;
+
+	*unavailable = 0;
+	return 0;
 }
 
 /*
@@ -2319,28 +2382,37 @@ static void ext4_mb_use_best_found(struct ext4_allocation_context *ac,
 					struct ext4_buddy *e4b)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
-	ext4_grpblk_t usable;
+	ext4_grpblk_t unavailable, usable;
 	int ret;
 
 	BUG_ON(ac->ac_b_ex.fe_group != e4b->bd_group);
 	BUG_ON(ac->ac_status == AC_STATUS_FOUND);
 
-	ac->ac_b_ex.fe_len = min(ac->ac_b_ex.fe_len, ac->ac_g_ex.fe_len);
-	usable = ext4_mb_usable_prefix(ac->ac_sb, &ac->ac_b_ex);
-	if (!usable) {
-		struct ext4_free_extent unavailable = ac->ac_b_ex;
-
+	/*
+	 * Search the complete free extent for a healthy run before limiting
+	 * the allocation to the goal length.  Failed RAID0 stripes are not
+	 * represented in the ext4 bitmap, so limiting the health scan first
+	 * can make a failed prefix hide healthy clusters later in the same
+	 * free extent.
+	 */
+	usable = ext4_mb_find_usable_extent(ac->ac_sb, &ac->ac_b_ex,
+					    &unavailable);
+	if (unavailable) {
 		/*
-		 * Keep a failed RAID0 cluster reserved in the in-core buddy.
-		 * The on-disk bitmap is deliberately left unchanged so the
-		 * reservation disappears after the failed member is restored.
+		 * Do not mark failed clusters used in either bitmap or buddy.
+		 * Keeping health state solely in MD means repaired ranges are
+		 * reusable immediately after their generation changes, and it
+		 * avoids making EXT4's free counters disagree with its bitmap.
+		 * Every allocation still passes this final health check.
 		 */
-		unavailable.fe_len = 1;
-		mb_mark_used(e4b, &unavailable);
+		ac->ac_b_ex.fe_start += unavailable;
+		ac->ac_b_ex.fe_len -= unavailable;
+	}
+	if (!usable) {
 		ac->ac_b_ex.fe_len = 0;
 		return;
 	}
-	ac->ac_b_ex.fe_len = usable;
+	ac->ac_b_ex.fe_len = min(usable, ac->ac_g_ex.fe_len);
 	ac->ac_b_ex.fe_logical = ac->ac_g_ex.fe_logical;
 	ret = mb_mark_used(e4b, &ac->ac_b_ex);
 
@@ -2636,11 +2708,12 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 
 		ext4_mb_use_best_found(ac, e4b);
 
-		BUG_ON(ac->ac_f_ex.fe_len != ac->ac_g_ex.fe_len);
-
-		if (EXT4_SB(sb)->s_mb_stats)
+		if (ac->ac_status == AC_STATUS_FOUND &&
+		    ac->ac_f_ex.fe_len == ac->ac_g_ex.fe_len &&
+		    EXT4_SB(sb)->s_mb_stats)
 			atomic_inc(&EXT4_SB(sb)->s_bal_2orders);
 
+		/* A health split can legitimately produce a shorter extent. */
 		break;
 	}
 }
@@ -3138,6 +3211,8 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
 			ac->ac_2order = array_index_nospec(i - 1,
 							   MB_NUM_ORDERS(sb));
 	}
+	if (ext4_bdev_is_degraded(sb->s_bdev))
+		ac->ac_2order = 0;
 
 	/* if stream allocation is enabled, use global goal */
 	if (ac->ac_flags & EXT4_MB_STREAM_ALLOC) {
@@ -6361,25 +6436,6 @@ ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
 	sbi = EXT4_SB(sb);
 
 	trace_ext4_request_blocks(ar);
-	/*
-	 * The reliable_groups layout puts regular-file contents on RAID0 and
-	 * filesystem metadata in the mirrored prefix.  Once any lower member is
-	 * unavailable, allocating new regular-file data cannot be made reliable:
-	 * scanning around failed RAID0 ranges also violates mballoc's assumption
-	 * that a selected power-of-two extent is consumed in full.  Fail the data
-	 * allocation before entering the buddy allocator.  Metadata allocations
-	 * are still allowed and therefore directory operations remain available.
-	 */
-	if (sbi->s_reliable_groups &&
-	    (ar->flags & EXT4_MB_HINT_DATA) &&
-	    S_ISREG(ar->inode->i_mode) &&
-	    !ext4_is_quota_file(ar->inode) &&
-	    !ext4_test_inode_flag(ar->inode, EXT4_INODE_EA_INODE) &&
-	    ext4_bdev_is_degraded(sb->s_bdev)) {
-		ar->len = 0;
-		*errp = -EIO;
-		return 0;
-	}
 	if (sbi->s_mount_state & EXT4_FC_REPLAY)
 		return ext4_mb_new_blocks_simple(ar, errp);
 

@@ -766,6 +766,36 @@ bool dm_bdev_range_is_unavailable(struct block_device *bdev,
 }
 EXPORT_SYMBOL_GPL(dm_bdev_range_is_unavailable);
 
+u64 dm_bdev_availability_generation(struct block_device *bdev)
+{
+	struct mapped_device *md;
+	struct dm_table *map;
+	struct dm_target *ti;
+	sector_t sector = bdev->bd_start_sect;
+	sector_t end = sector + bdev_nr_sectors(bdev);
+	u64 generation = 0;
+	int srcu_idx;
+
+	md = dm_get_md(bdev->bd_dev);
+	if (!md)
+		return 0;
+	map = dm_get_live_table(md, &srcu_idx);
+	while (map && sector < end) {
+		ti = dm_table_find_target(map, sector);
+		if (!ti || sector < ti->begin ||
+		    sector >= ti->begin + ti->len)
+			break;
+		if (ti->type->availability_generation)
+			generation +=
+				ti->type->availability_generation(ti);
+		sector = min(end, ti->begin + ti->len);
+	}
+	dm_put_live_table(md, srcu_idx);
+	dm_put(md);
+	return generation;
+}
+EXPORT_SYMBOL_GPL(dm_bdev_availability_generation);
+
 void dm_sync_table(struct mapped_device *md)
 {
 	synchronize_srcu(&md->io_barrier);

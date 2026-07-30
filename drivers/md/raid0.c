@@ -360,6 +360,37 @@ static bool raid0_rdev_unavailable(struct md_rdev *rdev)
 	return test_bit(Faulty, &rdev->flags) || is_rdev_broken(rdev);
 }
 
+static bool raid0_has_unavailable(struct mddev *mddev)
+{
+	struct r0conf *conf = READ_ONCE(mddev->private);
+	int slot;
+
+	if (!conf)
+		return test_bit(MD_BROKEN, &mddev->flags);
+	for (slot = 0; slot < conf->strip_zone[0].nb_dev; slot++) {
+		struct md_rdev *rdev = READ_ONCE(conf->devlist[slot]);
+
+		if (!rdev)
+			return true;
+		if (raid0_rdev_unavailable(rdev) ||
+		    READ_ONCE(rdev->badblocks.count))
+			return true;
+	}
+	return false;
+}
+
+static bool raid0_rdev_range_unavailable(struct md_rdev *rdev,
+					 sector_t sector,
+					 sector_t nr_sectors)
+{
+	sector_t first_bad, bad_sectors;
+
+	if (raid0_rdev_unavailable(rdev))
+		return true;
+	return is_badblock(rdev, sector, nr_sectors,
+			   &first_bad, &bad_sectors) != 0;
+}
+
 static bool raid0_is_range_unavailable(struct mddev *mddev, sector_t sector,
 				       sector_t nr_sectors)
 {
@@ -386,7 +417,11 @@ static bool raid0_is_range_unavailable(struct mddev *mddev, sector_t sector,
 			return true;
 		}
 
-		if (raid0_rdev_unavailable(rdev))
+		step = mddev->chunk_sectors - (offset % mddev->chunk_sectors);
+		step = min(step, zone->zone_end - sector);
+		step = min(step, end - sector);
+		if (raid0_rdev_range_unavailable(rdev,
+						offset + zone->dev_start, step))
 			return true;
 
 		step = mddev->chunk_sectors -
@@ -397,6 +432,37 @@ static bool raid0_is_range_unavailable(struct mddev *mddev, sector_t sector,
 	}
 
 	return false;
+}
+
+static bool raid0_record_io_error(struct mddev *mddev, struct md_rdev *rdev,
+				  sector_t sector, sector_t nr_sectors,
+				  blk_status_t status, enum req_op op)
+{
+	if (!nr_sectors)
+		return false;
+	/*
+	 * A failed discard is not evidence that the data range is unreadable
+	 * and must not retire a whole RAID0 member.  Report the original I/O
+	 * error to the caller, but otherwise treat it as handled here.
+	 */
+	if (op == REQ_OP_DISCARD)
+		return true;
+	if (op != REQ_OP_READ && op != REQ_OP_WRITE &&
+	    op != REQ_OP_WRITE_ZEROES)
+		return false;
+	if (rdev->badblocks.shift < 0)
+		return false;
+
+	if (op == REQ_OP_WRITE || op == REQ_OP_WRITE_ZEROES)
+		set_bit(WriteErrorSeen, &rdev->flags);
+	if (!rdev_set_badblocks(rdev, sector, nr_sectors, 0))
+		return false;
+
+	pr_warn_ratelimited("md/raid0:%s: recorded unavailable range %llu-%llu on %pg after I/O status %u\n",
+		mdname(mddev), (unsigned long long)sector,
+		(unsigned long long)(sector + nr_sectors - 1),
+		rdev->bdev, (__force unsigned int)status);
+	return true;
 }
 
 static sector_t raid0_size(struct mddev *mddev, sector_t sectors, int raid_disks)
@@ -490,9 +556,17 @@ static ssize_t raid0_failed_slots_store(struct mddev *mddev,
 		sysfs_notify_dirent_safe(rdev->sysfs_state);
 		cleared++;
 	}
+	if (cleared) {
+		md_availability_changed(mddev);
+		set_mask_bits(&mddev->sb_flags, 0,
+			      BIT(MD_SB_CHANGE_DEVS) |
+			      BIT(MD_SB_CHANGE_PENDING));
+	}
 	mddev->degraded = 0;
 	mddev_unlock(mddev);
 
+	if (cleared)
+		md_wakeup_thread(mddev->thread);
 	if (cleared)
 		pr_info("md/raid0:%s: cleared %d failed slot%s\n",
 			mdname(mddev), cleared, str_plural(cleared));
@@ -684,6 +758,7 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 	struct md_rdev *tmp_dev;
 	sector_t bio_sector = bio->bi_iter.bi_sector;
 	sector_t sector = bio_sector;
+	sector_t rdev_sector;
 
 	zone = find_zone(mddev->private, &sector);
 	switch (conf->layout) {
@@ -699,17 +774,22 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
 		return;
 	}
 
+	rdev_sector = sector + zone->dev_start;
 	if (unlikely(raid0_rdev_unavailable(tmp_dev))) {
 		bio_io_error(bio);
 		if (!test_bit(Faulty, &tmp_dev->flags))
 			md_error(mddev, tmp_dev);
 		return;
 	}
+	if (unlikely(raid0_rdev_range_unavailable(tmp_dev, rdev_sector,
+						  bio_sectors(bio)))) {
+		bio_io_error(bio);
+		return;
+	}
 
-	md_account_bio_rdev(mddev, tmp_dev, &bio);
+	md_account_bio_rdev(mddev, tmp_dev, rdev_sector, &bio);
 	bio_set_dev(bio, tmp_dev->bdev);
-	bio->bi_iter.bi_sector = sector + zone->dev_start +
-		tmp_dev->data_offset;
+	bio->bi_iter.bi_sector = rdev_sector + tmp_dev->data_offset;
 	mddev_trace_remap(mddev, bio, bio_sector);
 	mddev_check_write_zeroes(mddev, bio);
 	submit_bio_noacct(bio);
@@ -786,6 +866,11 @@ static void raid0_error(struct mddev *mddev, struct md_rdev *rdev)
 
 	if (!newly_failed)
 		return;
+	md_availability_changed(mddev);
+	set_mask_bits(&mddev->sb_flags, 0,
+		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
+	md_wakeup_thread(mddev->thread);
+	md_new_event();
 	sysfs_notify_dirent_safe(rdev->sysfs_state);
 	pr_crit("md/raid0:%s: Disk failure on %pg detected; continuing only on healthy mappings.\n",
 		mdname(mddev), rdev->bdev);
@@ -965,6 +1050,8 @@ static struct md_personality raid0_personality=
 
 	.make_request	= raid0_make_request,
 	.is_range_unavailable = raid0_is_range_unavailable,
+	.has_unavailable = raid0_has_unavailable,
+	.record_io_error = raid0_record_io_error,
 	.run		= raid0_run,
 	.free		= raid0_free,
 	.status		= raid0_status,

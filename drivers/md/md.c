@@ -789,6 +789,7 @@ int mddev_init(struct mddev *mddev)
 	atomic_set(&mddev->active, 1);
 	atomic_set(&mddev->openers, 0);
 	atomic_set(&mddev->sync_seq, 0);
+	atomic64_set(&mddev->availability_generation, 1);
 	spin_lock_init(&mddev->lock);
 	init_waitqueue_head(&mddev->sb_wait);
 	init_waitqueue_head(&mddev->recovery_wait);
@@ -3612,7 +3613,47 @@ static ssize_t bb_show(struct md_rdev *rdev, char *page)
 }
 static ssize_t bb_store(struct md_rdev *rdev, const char *page, size_t len)
 {
-	int rv = badblocks_store(&rdev->badblocks, page, len, 0);
+	struct mddev *mddev = rdev->mddev;
+	unsigned long long sector;
+	int length;
+	char newline;
+	int parsed;
+	int rv;
+
+	/*
+	 * The normal "sector length" form adds or acknowledges a range.
+	 * A leading '-' clears that exact physical-member range.  The clear
+	 * form is intentionally explicit: automatic reuse after a device
+	 * repair is unsafe unless an administrator has verified the medium.
+	 */
+	if (page[0] == '-') {
+		parsed = sscanf(page + 1, "%llu %d%c",
+				&sector, &length, &newline);
+		switch (parsed) {
+		case 3:
+			if (newline != '\n')
+				return -EINVAL;
+			fallthrough;
+		case 2:
+			if (length <= 0)
+				return -EINVAL;
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (!badblocks_clear(&rdev->badblocks, sector, length))
+			return len;
+		rv = len;
+	} else {
+		rv = badblocks_store(&rdev->badblocks, page, len, 0);
+	}
+	if (rv < 0)
+		return rv;
+
+	md_availability_changed(mddev);
+	set_mask_bits(&mddev->sb_flags, 0,
+		      BIT(MD_SB_CHANGE_CLEAN) | BIT(MD_SB_CHANGE_PENDING));
+	md_wakeup_thread(mddev->thread);
 	/* Maybe that ack was all we needed */
 	if (test_and_clear_bit(BlockedBadBlocks, &rdev->flags))
 		wake_up(&rdev->blocked_wait);
@@ -3627,7 +3668,17 @@ static ssize_t ubb_show(struct md_rdev *rdev, char *page)
 }
 static ssize_t ubb_store(struct md_rdev *rdev, const char *page, size_t len)
 {
-	return badblocks_store(&rdev->badblocks, page, len, 1);
+	struct mddev *mddev = rdev->mddev;
+	int rv;
+
+	rv = badblocks_store(&rdev->badblocks, page, len, 1);
+	if (rv < 0)
+		return rv;
+	md_availability_changed(mddev);
+	set_mask_bits(&mddev->sb_flags, 0,
+		      BIT(MD_SB_CHANGE_CLEAN) | BIT(MD_SB_CHANGE_PENDING));
+	md_wakeup_thread(mddev->thread);
+	return rv;
 }
 static struct rdev_sysfs_entry rdev_unack_bad_blocks =
 __ATTR(unacknowledged_bad_blocks, S_IRUGO|S_IWUSR, ubb_show, ubb_store);
@@ -8643,14 +8694,29 @@ const struct block_device_operations md_fops =
 bool md_bdev_is_degraded(struct block_device *bdev)
 {
 	struct mddev *mddev;
+	struct md_personality *pers;
 
 	if (bdev->bd_disk->fops != &md_fops)
 		return false;
 	mddev = bdev->bd_disk->private_data;
+	pers = READ_ONCE(mddev->pers);
 	return READ_ONCE(mddev->degraded) > 0 ||
-	       test_bit(MD_BROKEN, &mddev->flags);
+	       test_bit(MD_BROKEN, &mddev->flags) ||
+	       (pers && pers->has_unavailable &&
+		pers->has_unavailable(mddev));
 }
 EXPORT_SYMBOL_GPL(md_bdev_is_degraded);
+
+u64 md_bdev_availability_generation(struct block_device *bdev)
+{
+	struct mddev *mddev;
+
+	if (bdev->bd_disk->fops != &md_fops)
+		return 0;
+	mddev = bdev->bd_disk->private_data;
+	return atomic64_read(&mddev->availability_generation);
+}
+EXPORT_SYMBOL_GPL(md_bdev_availability_generation);
 
 bool md_bdev_range_is_unavailable(struct block_device *bdev,
 				  sector_t sector, sector_t nr_sectors)
@@ -9425,8 +9491,19 @@ static void md_end_clone_io(struct bio *bio)
 
 	if (bio_data_dir(orig_bio) == WRITE && md_bitmap_enabled(mddev, false))
 		md_bitmap_end(mddev, md_io_clone);
-	if (unlikely(bio->bi_status) && md_io_clone->rdev)
-		md_error(mddev, md_io_clone->rdev);
+	if (unlikely(bio->bi_status) && md_io_clone->rdev) {
+		struct md_personality *pers = READ_ONCE(mddev->pers);
+		bool recorded = false;
+
+		if (pers && pers->record_io_error)
+			recorded = pers->record_io_error(mddev,
+					md_io_clone->rdev,
+					md_io_clone->rdev_sector,
+					md_io_clone->nr_sectors,
+					bio->bi_status, md_io_clone->op);
+		if (!recorded)
+			md_error(mddev, md_io_clone->rdev);
+	}
 
 	if (bio->bi_status && !orig_bio->bi_status)
 		orig_bio->bi_status = bio->bi_status;
@@ -9453,6 +9530,9 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
 	md_io_clone->orig_bio = *bio;
 	md_io_clone->mddev = mddev;
 	md_io_clone->rdev = NULL;
+	md_io_clone->rdev_sector = 0;
+	md_io_clone->nr_sectors = bio_sectors(*bio);
+	md_io_clone->op = bio_op(*bio);
 	if (blk_queue_io_stat(bdev->bd_disk->queue))
 		md_io_clone->start_time = bio_start_io_acct(*bio);
 
@@ -9476,15 +9556,26 @@ void md_account_bio(struct mddev *mddev, struct bio **bio)
 EXPORT_SYMBOL_GPL(md_account_bio);
 
 void md_account_bio_rdev(struct mddev *mddev, struct md_rdev *rdev,
-			 struct bio **bio)
+			 sector_t rdev_sector, struct bio **bio)
 {
 	struct md_io_clone *md_io_clone;
 
 	md_account_bio(mddev, bio);
 	md_io_clone = container_of(*bio, struct md_io_clone, bio_clone);
 	md_io_clone->rdev = rdev;
+	md_io_clone->rdev_sector = rdev_sector;
 }
 EXPORT_SYMBOL_GPL(md_account_bio_rdev);
+
+void md_availability_changed(struct mddev *mddev)
+{
+	u64 generation = atomic64_inc_return(&mddev->availability_generation);
+
+	/* Keep zero reserved for devices which do not provide health state. */
+	if (unlikely(!generation))
+		atomic64_inc(&mddev->availability_generation);
+}
+EXPORT_SYMBOL_GPL(md_availability_changed);
 
 /* md_allow_write(mddev)
  * Calling this ensures that the array is marked 'active' so that writes
@@ -10627,6 +10718,7 @@ bool rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 		return false;
 	}
 
+	md_availability_changed(mddev);
 	/* Make sure they get written out promptly */
 	if (test_bit(ExternalBbl, &rdev->flags))
 		sysfs_notify_dirent_safe(rdev->sysfs_unack_badblocks);
@@ -10649,8 +10741,12 @@ void rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 	if (!badblocks_clear(&rdev->badblocks, s, sectors))
 		return;
 
+	md_availability_changed(rdev->mddev);
 	if (test_bit(ExternalBbl, &rdev->flags))
 		sysfs_notify_dirent_safe(rdev->sysfs_badblocks);
+	set_mask_bits(&rdev->mddev->sb_flags, 0,
+		      BIT(MD_SB_CHANGE_CLEAN) | BIT(MD_SB_CHANGE_PENDING));
+	md_wakeup_thread(rdev->mddev->thread);
 }
 EXPORT_SYMBOL_GPL(rdev_clear_badblocks);
 
